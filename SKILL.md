@@ -8,8 +8,8 @@ description: >-
   skills is a concern, or when skill discovery quality matters.
 license: MIT
 metadata:
-  version: 0.4.0
-  author: moonlight-lupin
+  version: 0.5.0
+  author: Green-Needle-Tech
   platforms: [linux, macos, windows]
   tags: [bm25, skill-retrieval, system-prompt, token-optimization, plugin]
   hermes:
@@ -84,14 +84,15 @@ Measured on a Hermes install with ~300 skills; savings scale with skill count.
 
 ## Installation
 
-Copy or symlink this directory into the Hermes plugins folder:
+This repository IS the plugin directory. Copy or symlink it into the Hermes
+plugins folder:
 
 ```bash
-# From this repo
-ln -s "$(pwd)/plugins/skill-retrieval" ~/.hermes/plugins/skill-retrieval
+# From a checkout of this repo (repo root = plugin root)
+ln -s "$(pwd)" ~/.hermes/plugins/skill-retrieval
 
 # Or copy
-cp -r plugins/skill-retrieval ~/.hermes/plugins/skill-retrieval
+cp -r . ~/.hermes/plugins/skill-retrieval
 ```
 
 User plugins are opt-in: Hermes discovers the directory but does not load it
@@ -113,17 +114,27 @@ pip install pyyaml
 
 ## Configuration
 
+All settings are environment variables (read once at plugin import; restart
+the session to apply):
+
 | Setting | Default | How to set |
 |---------|---------|------------|
-| `TOP_K` | `6` | Env var `SKILL_RETRIEVAL_TOP_K` |
-| System prompt compaction | enabled | Set `SKILL_RETRIEVAL_COMPACT=0` to disable compaction while keeping BM25 retrieval injection |
-| BM25 `k1` | `1.5` | Constant in `scripts/bm25_retriever.py` |
-| BM25 `b` | `0.75` | Constant in `scripts/bm25_retriever.py` |
+| `TOP_K` | `6` | `SKILL_RETRIEVAL_TOP_K` |
+| System prompt compaction | enabled | `SKILL_RETRIEVAL_COMPACT=0` disables compaction while keeping BM25 retrieval injection |
+| BM25 `k1` | `1.5` | `SKILL_RETRIEVAL_K1` (must be > 0) |
+| BM25 `b` | `0.75` | `SKILL_RETRIEVAL_B` (must be > 0) |
+| Relevance floor | `0.25` | `SKILL_RETRIEVAL_MIN_SCORE_RATIO` (in `[0, 1)`; results scoring below this fraction of the top score are dropped) |
 
 ```bash
 export SKILL_RETRIEVAL_TOP_K=8
 export SKILL_RETRIEVAL_COMPACT=0
+export SKILL_RETRIEVAL_K1=1.2
+export SKILL_RETRIEVAL_B=0.7
+export SKILL_RETRIEVAL_MIN_SCORE_RATIO=0.35
 ```
+
+Invalid values (non-numeric, out of range) log a warning and fall back to
+the default.
 
 ## Verify it's working
 
@@ -138,22 +149,42 @@ silently empty. After restart, check the Hermes logs.
 **Degraded — these warnings mean it's not working:**
 
 - `Cannot locate prompt_builder — compaction skipped` (Phase 1 failed; Phase 2
-  still runs for anonymous sessions, but named sessions skip injection because
-  no capability snapshot is recorded)
+  still runs — sessions without a recorded capability snapshot fall back to
+  fail-open retrieval with tool-dependent skills filtered out)
 - `No active skills found for BM25 index` (index is empty — zero retrieval injection)
 
 ## How it works
 
-- **Tokenizer** — lowercases text, strips punctuation, splits on whitespace.
-- **Corpus** — each skill becomes `"name: description"` from SKILL.md YAML
-  frontmatter. Disabled skills from `~/.hermes/config.yaml` are skipped.
-- **Index** — BM25 Okapi TF saturation + Lucene IDF
-  `log(1 + (N-df+0.5)/(df+0.5))` (always positive, so small corpora and common
-  terms still score), stored as an inverted index:
-  ``dict[str, list[tuple[int, float]]]`` mapping each term to a posting list of
-  (doc_index, precomputed BM25 weight).
-- **Retrieve** — for each unique query token present in the index, walk its
-  posting list and accumulate scores; sort by descending score (score > 0 only).
+**Corpus.** Each skill becomes one BM25 document built from its SKILL.md
+frontmatter with field boosts: the name is repeated 3x (users and the model
+reference skills by name), tags 2x (the capability vocabulary queries
+actually use), the category path once, and the FULL description once —
+Hermes truncates prompt descriptions to 60 characters, and the index
+deliberately bypasses that cut. Tags are merged from top-level `tags`,
+`metadata.tags` AND `metadata.hermes.tags` (the majority form in real
+corpora). Disabled skills and plugin skills gated off for the session are
+skipped; every recorded skill carries a `needs_tools` flag derived from its
+`requires_tools` / `requires_toolsets` / `fallback_for_*` conditions.
+
+**Term pipeline** (applied identically to the corpus and every query):
+URLs and bare domains are stripped whole; CamelCase compounds are split
+(`skillView` → `skillView skill View`, keeping the original); Chinese and
+Japanese text is segmented into runs plus overlapping bigrams; common
+English words and web fragments (`me`, `the`, `use`, `https`, `com`, …)
+are dropped as stopwords; a conservative suffix stripper stems the rest
+(`skills` → `skill`, `studies` → `study`).
+
+**Index.** BM25 Okapi TF saturation + Lucene IDF
+`log(1 + (N-df+0.5)/(df+0.5))` (always positive, so small corpora and
+common terms still score), stored as an inverted index:
+``dict[str, list[tuple[int, float]]]`` mapping each term to a posting list
+of (doc_index, precomputed BM25 weight).
+
+**Retrieve.** For each unique query token present in the index, walk its
+posting list and accumulate scores; sort by descending score (score > 0
+only); then drop results scoring below `SKILL_RETRIEVAL_MIN_SCORE_RATIO`
+(default 0.25) of the top score, so off-domain messages don't inject a
+top-K of noise.
 
 ## Performance
 
@@ -181,10 +212,17 @@ silently empty. After restart, check the Hermes logs.
   use `skill_view(name)` for the full skill body.
 - Compaction requires Hermes's `agent.prompt_builder` module; if it cannot be
   imported, Phase 1 is skipped.
-- A named session is only injected once its system prompt has been built in
-  this process (that build records the session's tool capabilities). A session
-  restored after a restart without a rebuild gets no injection rather than
-  risking skills Hermes hides from it.
+- A named session whose system prompt was never built in this process (after
+  a gateway restart, or when resuming a session) has no recorded capability
+  snapshot. Since v0.5.0 the hook keeps retrieving anyway — fail-open — and
+  filters out only the skills whose activation depends on tool capabilities
+  (`requires_tools` / `requires_toolsets` / `fallback_for_*`). Skills with
+  platform or gateway-channel gates are evaluated as usual.
+- Each turn's injected "Retrieved Skills" block stays in the conversation
+  history, so the token saving is gradually consumed in long sessions
+  (roughly 8–9 turns of top-6 injections on a 100+ skill install). For
+  long-running sessions, lower `SKILL_RETRIEVAL_TOP_K` or set
+  `SKILL_RETRIEVAL_COMPACT=0` and rely on `skill_view(name)` alone.
 - A content-only edit of a nested `SKILL.md` (`category/skill/SKILL.md`)
   made outside Hermes (e.g. in an editor) changes no directory mtime, so it is
   picked up only after Hermes clears its skills prompt cache or the agent
@@ -193,9 +231,13 @@ silently empty. After restart, check the Hermes logs.
 - Phase 1 depends on Hermes internals (`agent.prompt_builder`) and can break
   on a Hermes upgrade.
 - BM25 top-1 precision is soft: the best-matching skill is often not rank 1,
-  though it usually lands within the first few results. Ranking depends entirely
-  on your own corpus and how its descriptions are worded, so `TOP_K` below ~5 is
-  not recommended.
+  though it usually lands within the first few results. v0.5.0 materially
+  improved ranking (full-length descriptions, merged tags, stopword/URL
+  filtering, a 0.25 relevance floor): on a 23-skill benchmark with 20
+  real-world-style queries, top-1 is 18/20, recall@6 19/20, MRR 0.92
+  (previously MRR 0.57). Ranking still depends entirely on your own corpus
+  and how its descriptions are worded, so `TOP_K` below ~5 is not
+  recommended.
 - The stdlib index computes in float64 (the previous scipy version used
   float32). Equal-scoring skills may order differently than before. This is
   harmless — the scores are genuine ties (~1e-6 difference) — but it is a real

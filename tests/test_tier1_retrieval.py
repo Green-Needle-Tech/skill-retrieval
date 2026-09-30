@@ -216,8 +216,10 @@ def test_relevance_floor_keeps_top1_and_handles_edge_cases():
 
 
 @pytest.mark.parametrize("raw,expected", [
-    (None, 0.15), ("", 0.15), ("0.3", 0.3), ("0", 0.0),
-    ("1.0", 0.15), ("-0.1", 0.15), ("junk", 0.15),
+    # v0.5.0: default raised from 0.15 to 0.25 (scores spread out once
+    # stopwords/URL stripping and full descriptions landed).
+    (None, 0.25), ("", 0.25), ("0.3", 0.3), ("0", 0.0),
+    ("1.0", 0.25), ("-0.1", 0.25), ("junk", 0.25),
 ])
 def test_parse_min_score_ratio(raw, expected):
     mod = _load_plugin_module()

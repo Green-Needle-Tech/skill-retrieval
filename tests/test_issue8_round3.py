@@ -10,10 +10,12 @@ the named-session snapshot-binding contract from the issue's final comment:
        session_id parameter, so the ContextVar/env session is the only
        identity source available at build time.
 
-    2. A NAMED session whose exact snapshot is missing (or evicted) must SKIP
-       BM25 injection for that turn (return no context) instead of
-       falling back to the fail-open zero-argument corpus. Missing
-       retrieval is safer than injecting a skill Hermes explicitly hid.
+    2. A NAMED session whose exact snapshot is missing (or evicted) used to
+       SKIP BM25 injection entirely. Since v0.5.0 that is considered too
+       cautious: retrieval proceeds against the fail-open corpus and the
+       hook filters out exactly the skills whose activation depends on tool
+       capabilities (requires_tools / requires_toolsets / fallback_for_*),
+       which are the only ones a fail-open corpus could wrongly suggest.
 
     3. No cross-session fallback: a named session must never read another
        named session's snapshot (isolation direction from 50daa54 kept).
@@ -191,7 +193,7 @@ def test_build_snapshot_explicit_session_id_still_wins(monkeypatch, tmp_path):
     assert "sess-ENV" not in mod._session_capability_snaps
 
 
-# ─── Contract 2: named session with missing/stale snapshot must skip ────────
+# ─── Contract 2: named session with missing/stale snapshot keeps retrieving ──
 
 
 def _setup_plugin_module(br, monkeypatch, tmp_path, *, conditions_map):
@@ -230,25 +232,33 @@ def _advance_clock(monkeypatch, seconds):
     monkeypatch.setattr(time, "monotonic", lambda: real + seconds)
 
 
-def test_named_session_missing_snapshot_skips_injection(monkeypatch, tmp_path):
-    """A NAMED session with no exact snapshot must get NO injection rather
-    than the fail-open bare corpus (reporter contract #2: 'missing exact
-    named snapshot: FAIL — hidden Skill retrieved' must become a skip)."""
+def test_named_session_missing_snapshot_fails_open_filters_tool_gated(monkeypatch, tmp_path):
+    """A NAMED session with no exact snapshot must KEEP retrieving (v0.5.0:
+    skipping the whole turn was too cautious) against the fail-open corpus,
+    filtering out only tool-dependent skills (the old reporter contract #2
+    'hidden Skill retrieved' is now prevented by the needs_tools filter)."""
     _load_fresh()
     mod = _load_plugin_init(monkeypatch, tmp_path)
     _write_gated_corpus(monkeypatch, tmp_path)
 
-    # Sanity: the fail-open corpus really would leak the gated skill.
-    leaked = mod._on_pre_llm_call(session_id="", user_message="quasarneedle9z")
-    assert leaked and "gated-skill" in leaked["context"]
+    # Sanity: the fail-open corpus really does rank the gated skill first…
+    index = br.get_index()
+    raw = index.retrieve("quasarneedle9z filler", top_k=3)
+    assert raw and raw[0][0] == "gated", "gated skill must be in the fail-open corpus"
 
+    # …so the filter, not the corpus, is what keeps it out of the injection.
     # No snapshot recorded for "sess-A" at all.
     result = mod._on_pre_llm_call(
-        session_id="sess-A", user_message="quasarneedle9z"
+        session_id="sess-A", user_message="quasarneedle9z filler"
     )
-    assert result is None, (
-        "named session with missing snapshot must skip injection, "
-        "not fall back to the fail-open corpus"
+    assert result is not None, (
+        "named session with missing snapshot must keep retrieving fail-open, "
+        "not skip the turn"
+    )
+    assert "plain-skill" in result["context"]
+    assert "gated-skill" not in result["context"], (
+        "tool-dependent skills must be filtered when the capability snapshot "
+        "is unknown"
     )
 
 
@@ -293,9 +303,10 @@ def test_snapshot_cache_holds_more_than_eight_sessions(monkeypatch, tmp_path):
     assert "gated-skill" not in result["context"]
 
 
-def test_named_session_evicted_snapshot_skips_injection(monkeypatch, tmp_path):
+def test_named_session_evicted_snapshot_fails_open_filters_tool_gated(monkeypatch, tmp_path):
     """Once the bounded LRU evicts a named session's snapshot, that session
-    must skip injection, not fall back to the fail-open corpus."""
+    keeps retrieving fail-open (v0.5.0) with tool-dependent skills filtered,
+    rather than skipping injection entirely."""
     _load_fresh()
     mod = _load_plugin_init(monkeypatch, tmp_path)
     SC = _FakeSessionContext.install(monkeypatch)
@@ -309,9 +320,13 @@ def test_named_session_evicted_snapshot_skips_injection(monkeypatch, tmp_path):
 
     assert "sess-A" not in mod._session_capability_snaps
     result = mod._on_pre_llm_call(
-        session_id="sess-A", user_message="quasarneedle9z"
+        session_id="sess-A", user_message="quasarneedle9z filler"
     )
-    assert result is None
+    assert result is not None, (
+        "evicted snapshot must fall back to fail-open retrieval, not skip"
+    )
+    assert "plain-skill" in result["context"]
+    assert "gated-skill" not in result["context"]
 
 
 def test_snapshot_captured_when_compaction_disabled(monkeypatch, tmp_path):
@@ -345,17 +360,21 @@ def test_snapshot_captured_when_compaction_disabled(monkeypatch, tmp_path):
 
 def test_anonymous_session_keeps_fail_open(monkeypatch, tmp_path):
     """The anonymous path (session_id='') keeps Hermes' fail-open semantics:
-    bare get_index() fallback when no snapshot exists. Backward compat with
-    test_no_capability_args_fails_open."""
+    bare get_index() fallback when no snapshot exists. Since v0.5.0 it also
+    filters tool-dependent skills out of the results, mirroring the
+    named-session fail-open path."""
     _load_fresh()
     mod = _load_plugin_init(monkeypatch, tmp_path)
     _write_gated_corpus(monkeypatch, tmp_path)
 
-    result = mod._on_pre_llm_call(session_id="", user_message="quasarneedle9z")
+    result = mod._on_pre_llm_call(session_id="", user_message="quasarneedle9z filler")
     assert result is not None and result.get("context"), (
         "anonymous session must keep the fail-open behavior"
     )
-    assert "gated-skill" in result["context"]
+    assert "plain-skill" in result["context"]
+    assert "gated-skill" not in result["context"], (
+        "anonymous fail-open must still filter tool-dependent skills"
+    )
 
 
 # ─── Contract 3: cross-session isolation with binding ───────────────────────

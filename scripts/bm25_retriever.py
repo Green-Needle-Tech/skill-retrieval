@@ -72,26 +72,34 @@ B = _env_float("SKILL_RETRIEVAL_B", 0.75)
 
 # ─── Tokenizer ────────────────────────────────────────────────────────────────
 
+def _flatten_text(text: str) -> str:
+    """Coerce any input to a plain string.
+
+    Defends against non-str queries: Telegram can deliver the user message
+    as a list of content parts (str or {"text": ...} dicts). Anything else
+    is stringified. Shared by ``tokenize`` and ``_normalize_tokens``.
+    """
+    if isinstance(text, str):
+        return text
+    if isinstance(text, (list, tuple)):
+        parts: list[str] = []
+        for part in text:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                value = part.get("text") or part.get("caption")
+                if isinstance(value, str):
+                    parts.append(value)
+        return " ".join(parts)
+    return str(text)
+
+
 def tokenize(text: str) -> list[str]:
     """Simple whitespace + punctuation tokenizer, lowercased.
 
-    Defends against non-str queries: Telegram can deliver the user message
-    as a list of content parts (str or {"text": ...} dicts). Flatten to a
-    plain string before tokenizing; anything else is stringified.
+    Non-str inputs are flattened via ``_flatten_text`` first.
     """
-    if not isinstance(text, str):
-        if isinstance(text, (list, tuple)):
-            parts: list[str] = []
-            for part in text:
-                if isinstance(part, str):
-                    parts.append(part)
-                elif isinstance(part, dict):
-                    value = part.get("text") or part.get("caption")
-                    if isinstance(value, str):
-                        parts.append(value)
-            text = " ".join(parts)
-        else:
-            text = str(text)
+    text = _flatten_text(text)
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
     return text.split()
@@ -188,28 +196,54 @@ def _stem(token: str) -> str:
     return token
 
 
+# ─── Noise filtering (URLs, stopwords) ───────────────────────────────────────
+
+# URLs and bare domains in descriptions/queries contribute tokens like
+# "https", "com", "github", "www" and repo-path fragments that match far
+# too many documents. Stripped whole before tokenization.
+_URL_RE = re.compile(
+    r"(?:https?://|www\.)\S+"
+    r"|\b[\w-]+(?:\.[\w-]+)*\.(?:com|net|org|io|dev|ai|app|co|me|sh|xyz)\b(?:/\S*)?"
+)
+
+# Common English words plus web/URL fragments. Applied identically to the
+# corpus and the query, so both sides share one term space. Deliberately
+# small: over-filtering removes real retrieval signal. "use/uses/used/
+# using" are included because nearly every skill description opens with
+# "Use when ..." — the token carries no discriminative power.
+_STOPWORDS = frozenset("""
+    a an the and or but if then else of for to in on at by with from as
+    into about over under after before between during without within along
+    across is are was were be been being am it its this that these those
+    there here
+    i me my mine we us our ours you your yours he him his she her hers
+    they them their theirs
+    do does did doing done have has had having will would shall should
+    can could may might must not no nor so than too very just also more
+    most some any all each every both few other own same such only
+    when where why what which who whom whose how
+    use uses used using
+    http https www com net org io dev ai app co me sh
+    etc e g ie via per
+""".split())
+
+
 def _normalize_tokens(text: str) -> list[str]:
     """Full analysis pipeline for index building and querying.
 
-    Order matters: CamelCase splitting must see the original casing, CJK
-    bigrams must see whole runs, and stemming runs last on clean tokens.
+    Order matters: URL stripping runs first (URLs contribute noise tokens
+    like ``https``/``com``), CamelCase splitting must see the original
+    casing, CJK bigrams must see whole runs, and stemming runs last on
+    clean tokens. Stopwords are dropped on both the corpus and the query
+    side, so common words never skew rankings (issue: "book me a flight"
+    ranked grill-me first via the token "me").
     ``tokenize``'s contract (unit-tested) is unchanged; this is the layer
     above it used by BM25Index.build/retrieve.
     """
-    if not isinstance(text, str):
-        # Reuse tokenize's non-str flattening for list-form queries.
-        if isinstance(text, (list, tuple)):
-            parts = []
-            for part in text:
-                if isinstance(part, str):
-                    parts.append(part)
-                elif isinstance(part, dict):
-                    value = part.get("text") or part.get("caption")
-                    if isinstance(value, str):
-                        parts.append(value)
-            text = " ".join(parts)
-        else:
-            text = str(text)
+    text = _flatten_text(text)
+    # Strip URLs and bare domains before tokenization: their scheme/host
+    # fragments ("https", "com", "github") match far too many documents.
+    text = _URL_RE.sub(" ", text)
     # CamelCase expansion before lowercasing destroys the case signal.
     text = _expand_camel(text)
     tokens = tokenize(_split_cjk(text))
@@ -220,7 +254,7 @@ def _normalize_tokens(text: str) -> list[str]:
             out.append(tok)
             for i in range(len(tok) - 1):
                 out.append(tok[i : i + 2])
-        else:
+        elif tok not in _STOPWORDS:
             out.append(_stem(tok))
     return out
 
@@ -281,11 +315,92 @@ def _parse_skill_md(skill_md: Path) -> tuple[str, str]:
     return name, desc
 
 
+# Conditional-activation fields Hermes gates skills on (mirrors
+# agent.skill_utils._CONDITION_KEYS). Kept as a separate tuple because
+# session_platforms is NOT a tool dependency.
+_TOOL_CONDITION_KEYS = (
+    "requires_tools", "requires_toolsets", "fallback_for_tools", "fallback_for_toolsets",
+)
+
+
+def _hermes_metadata(frontmatter: dict) -> dict:
+    """Return the ``metadata.hermes`` sub-dict of parsed frontmatter."""
+    meta = frontmatter.get("metadata") if isinstance(frontmatter, dict) else None
+    hermes = meta.get("hermes") if isinstance(meta, dict) else None
+    return hermes if isinstance(hermes, dict) else {}
+
+
+def _extract_frontmatter_tags(frontmatter: dict) -> list[str]:
+    """Merge tags from top-level ``tags``, ``metadata.tags`` and
+    ``metadata.hermes.tags``.
+
+    Most skill authors keep tags under ``metadata.hermes.tags``; reading
+    only the top-level field made the strongest capability vocabulary
+    invisible to the index.
+    """
+    if not isinstance(frontmatter, dict):
+        return []
+    tags = _normalize_tags(frontmatter.get("tags"))
+    meta = frontmatter.get("metadata")
+    if isinstance(meta, dict):
+        tags += _normalize_tags(meta.get("tags"))
+        tags += _normalize_tags(_hermes_metadata(frontmatter).get("tags"))
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tags:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _needs_tools(frontmatter: dict) -> bool:
+    """True when the skill's activation depends on tool capabilities.
+
+    Such skills are the only ones a fail-open corpus (no capability
+    snapshot) could wrongly suggest; the retrieval hook filters exactly
+    these when the session's snapshot is unknown.
+    """
+    return _needs_tools_from_conditions(
+        {key: _hermes_metadata(frontmatter).get(key, []) for key in _TOOL_CONDITION_KEYS}
+    )
+
+
+def _needs_tools_from_conditions(conditions: "dict | None") -> bool:
+    """``_needs_tools`` over an ``extract_skill_conditions`` result."""
+    if not isinstance(conditions, dict):
+        return False
+    return any(conditions.get(key) for key in _TOOL_CONDITION_KEYS)
+
+
 def _parse_skill_md_full(skill_md: Path) -> tuple[str, str, list[str]]:
     """Return (name, description, tags) parsed from a SKILL.md frontmatter.
 
+    The description is the FULL frontmatter text — Hermes truncates
+    descriptions to SKILL_PROMPT_DESC_LIMIT (60) for the system prompt, and
+    indexing that cut loses the tail of 60+ character descriptions. Tags
+    merge top-level + metadata.hermes.tags (see ``_extract_frontmatter_tags``).
+
     Same failure semantics as ``_parse_skill_md`` — never raises; tags is
     [] whenever it is missing or malformed.
+    """
+    name, desc, tags = "", "", []
+    data = _parse_skill_frontmatter(skill_md)
+    if data is not None:
+        name = "" if data.get("name") is None else str(data.get("name"))
+        desc = "" if data.get("description") is None else str(data.get("description"))
+        if data.get("name") is None or data.get("description") is None:
+            logger.warning("Missing name or description in frontmatter of %s", skill_md)
+        tags = _extract_frontmatter_tags(data)
+    return name, desc, tags
+
+
+def _parse_skill_frontmatter(skill_md: Path) -> "dict | None":
+    """Return the parsed frontmatter mapping of a SKILL.md, or None.
+
+    Returns None for invalid frontmatter (no fences, malformed YAML,
+    non-mapping) and for a file that cannot be read. Never raises, so one
+    unreadable skill cannot abort the whole index build.
     """
     import yaml
 
@@ -293,14 +408,14 @@ def _parse_skill_md_full(skill_md: Path) -> tuple[str, str, list[str]]:
         text = skill_md.read_text(errors="replace")
     except OSError as exc:
         logger.warning("Cannot read %s: %s", skill_md, exc)
-        return "", "", []
+        return None
     lines = text.splitlines()
 
     # Frontmatter must start at the first line (allowing optional BOM).
     first_line = lines[0].lstrip("\ufeff").strip() if lines else ""
     if first_line != "---":
         logger.warning("No YAML frontmatter in %s (first line is not '---')", skill_md)
-        return "", "", []
+        return None
 
     # Find the closing fence.
     close_idx = None
@@ -310,28 +425,19 @@ def _parse_skill_md_full(skill_md: Path) -> tuple[str, str, list[str]]:
             break
     if close_idx is None:
         logger.warning("No closing YAML frontmatter fence in %s", skill_md)
-        return "", "", []
+        return None
 
     fm_text = "\n".join(lines[1:close_idx])
     try:
         data = yaml.safe_load(fm_text)
     except yaml.YAMLError:
         logger.warning("Malformed YAML frontmatter in %s", skill_md)
-        return "", "", []
+        return None
 
     if not isinstance(data, dict):
         logger.warning("Non-mapping YAML frontmatter in %s", skill_md)
-        return "", "", []
-
-    name = data.get("name")
-    desc = data.get("description")
-    if name is None or desc is None:
-        logger.warning("Missing name or description in frontmatter of %s", skill_md)
-
-    name_str = "" if name is None else str(name)
-    desc_str = "" if desc is None else str(desc)
-    tags = _normalize_tags(data.get("tags"))
-    return name_str, desc_str, tags
+        return None
+    return data
 
 
 def _iter_skill_files(root: Path, prefix: str = "") -> list[tuple[Path, str, str]]:
@@ -379,7 +485,7 @@ def _skill_id_from_entry(entry: dict, prefix: str = "") -> str:
 
 def _record_skill(
     skills: list[dict], seen_names: set[str], entry: dict, *, prefix: str = "",
-    tags: "list[str] | None" = None,
+    tags: "list[str] | None" = None, needs_tools: bool = False,
 ) -> None:
     """Append a parsed Hermes skill entry while preserving first-seen precedence."""
     name = str(entry.get("frontmatter_name") or entry.get("skill_name") or "").strip()
@@ -395,6 +501,10 @@ def _record_skill(
         "frontmatter_name": str(entry.get("frontmatter_name") or name),
         "description": desc,
         "tags": skill_tags,
+        # True when the skill's activation depends on tool capabilities
+        # (requires_*/fallback_for_*). The hook filters exactly these out
+        # when a session's capability snapshot is unknown (fail-open corpus).
+        "needs_tools": bool(needs_tools),
         "text": _build_index_text(
             name, desc, skill_tags,
             category=str(entry.get("category") or ""),
@@ -537,7 +647,15 @@ def _load_active_skills_legacy() -> list[dict]:
         if leaf_name in disabled or rel_name in disabled:
             continue
 
-        name, desc, tags = _parse_skill_md_full(skill_md)
+        fm_data = _parse_skill_frontmatter(skill_md)
+        if fm_data is not None:
+            name = "" if fm_data.get("name") is None else str(fm_data.get("name"))
+            desc = "" if fm_data.get("description") is None else str(fm_data.get("description"))
+            tags = _extract_frontmatter_tags(fm_data)
+            needs_tools = _needs_tools(fm_data)
+        else:
+            name, desc, tags = "", "", []
+            needs_tools = False
         if not name:
             name = leaf_name
 
@@ -547,6 +665,7 @@ def _load_active_skills_legacy() -> list[dict]:
             "name": name,
             "description": desc,
             "tags": tags,
+            "needs_tools": needs_tools,
             "text": _build_index_text(name, desc, tags),
         })
 
@@ -631,8 +750,9 @@ def load_active_skills(
             entry = _build_snapshot_entry(skill_file, root, frontmatter, desc)
             if entry["frontmatter_name"] in disabled or entry["skill_name"] in disabled:
                 return
+            conditions = extract_skill_conditions(frontmatter)
             if not _skill_should_show(
-                extract_skill_conditions(frontmatter),
+                conditions,
                 available_tools,
                 available_toolsets,
                 platform_hint,
@@ -644,8 +764,29 @@ def load_active_skills(
                 entry["frontmatter_name"] = qname
                 entry["skill_name"] = qname
                 prefix = ""
-            file_tags = _normalize_tags(frontmatter.get("tags"))
-            _record_skill(skills, seen_names, entry, prefix=prefix, tags=file_tags)
+            # Re-parse the file for the FULL frontmatter: Hermes truncates
+            # descriptions to SKILL_PROMPT_DESC_LIMIT (60) for the system
+            # prompt, and that cut loses most of the retrieval signal for
+            # 60+ character descriptions. This also picks up merged tags
+            # (top-level + metadata.hermes.tags) and the raw frontmatter
+            # for the needs_tools flag.
+            fm_data = _parse_skill_frontmatter(skill_file)
+            fm_desc = ""
+            file_tags: list[str] = []
+            if fm_data is not None:
+                if fm_data.get("description") is not None:
+                    fm_desc = str(fm_data.get("description"))
+                file_tags = _extract_frontmatter_tags(fm_data)
+            if fm_desc:
+                entry = dict(entry)
+                entry["description"] = fm_desc
+            if not file_tags:
+                file_tags = _extract_frontmatter_tags(frontmatter)
+            needs = _needs_tools_from_conditions(conditions)
+            _record_skill(
+                skills, seen_names, entry, prefix=prefix,
+                tags=file_tags, needs_tools=needs,
+            )
         except Exception as exc:
             logger.debug("Error reading skill %s: %s", skill_file, exc)
 
@@ -688,11 +829,14 @@ def load_active_skills(
             try:
                 path_obj = Path(skill_path)
                 if path_obj.is_file():
-                    _ok, file_fm, file_desc = _parse_skill_file(path_obj)
-                    if file_desc:
-                        desc = file_desc
-                    if file_fm:
-                        frontmatter = file_fm
+                    # Full frontmatter re-parse: the registry's description
+                    # (and Hermes' parse) is truncated to 60 chars, and tags
+                    # live under metadata.hermes.tags as often as top-level.
+                    fm_data = _parse_skill_frontmatter(path_obj)
+                    if fm_data is not None:
+                        if fm_data.get("description") is not None:
+                            desc = str(fm_data.get("description"))
+                        frontmatter = fm_data
             except Exception as exc:
                 logger.debug("Error reading registry skill %s: %s", skill_path, exc)
         try:
@@ -707,8 +851,9 @@ def load_active_skills(
         )
         if qualified in disabled or bare in disabled:
             return
+        conditions = extract_skill_conditions(frontmatter)
         if not _skill_should_show(
-            extract_skill_conditions(frontmatter),
+            conditions,
             available_tools,
             available_toolsets,
             platform_hint,
@@ -722,7 +867,8 @@ def load_active_skills(
         }
         _record_skill(
             skills, seen_names, entry,
-            tags=_normalize_tags(frontmatter.get("tags")),
+            tags=_extract_frontmatter_tags(frontmatter),
+            needs_tools=_needs_tools_from_conditions(conditions),
         )
 
     # Precedence mirrors Hermes: trusted project-local → profile-local →

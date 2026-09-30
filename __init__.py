@@ -18,6 +18,10 @@ Configuration:
   System prompt compaction is enabled by default. Set
   ``SKILL_RETRIEVAL_COMPACT=0`` to keep retrieval injection while leaving the
   original Hermes skills prompt untouched.
+  BM25 parameters: ``SKILL_RETRIEVAL_K1`` (default 1.5),
+  ``SKILL_RETRIEVAL_B`` (default 0.75). Relevance floor:
+  ``SKILL_RETRIEVAL_MIN_SCORE_RATIO`` (default 0.25, in [0, 1)) — results
+  scoring below this fraction of the top score are dropped.
 """
 
 import logging
@@ -41,7 +45,12 @@ _DEFAULT_TOP_K = 6
 
 # Relevance floor: results scoring below this fraction of the top score are
 # dropped, so off-domain messages don't inject a full top-K of noise.
-_DEFAULT_MIN_SCORE_RATIO = 0.15
+# v0.5.0 raised this from 0.15: with stopwords, URL stripping, full-length
+# descriptions and merged tags, BM25 scores actually spread out, so a
+# 0.25 ratio removes weak tail matches (single low-IDF term hits) without
+# dropping any genuinely relevant result (validated on a 129-skill corpus:
+# all 15 relevant hits scored >= 0.9 of the top score).
+_DEFAULT_MIN_SCORE_RATIO = 0.25
 # Chit-chat / acknowledgement messages skip injection entirely. Matched on
 # the token count of the normalized message plus a small stopword pattern.
 _CHATTY_MAX_TOKENS = 3
@@ -283,7 +292,6 @@ def _compact_skills_prompt(compact: bool = True):
             return full_prompt
 
         # Parse the <available_skills> block and strip descriptions
-        import re
         # Extract everything between <available_skills> and </available_skills>
         match = re.search(r"<available_skills>(.*?)</available_skills>", full_prompt, re.DOTALL)
         if not match:
@@ -303,8 +311,13 @@ def _compact_skills_prompt(compact: bool = True):
             # Skill entries (e.g. "    - name: description")
             if stripped.startswith("-"):
                 name = stripped[1:].strip()
-                if ":" in name:
-                    name = name.split(":")[0].strip()
+                # Split on ": " (the name→description separator) instead of
+                # ":" so qualified names survive intact: "chief-of-staff:
+                # brief: Inject a briefing" keeps "chief-of-staff:brief",
+                # and a bare "- org:acme" line (no description) stays whole.
+                if ": " in name:
+                    name = name.split(": ", 1)[0].strip()
+                name = name.rstrip(":")
                 compact_lines.append(f"    - {name}")
                 in_skill_entry = True
                 entry_indent = indent
@@ -319,9 +332,11 @@ def _compact_skills_prompt(compact: bool = True):
                 compact_lines.append(f"  {stripped}")
                 in_skill_entry = False
             # Category headers (e.g. "  creative:" or "  creative: Some description")
-            elif stripped.endswith(":") or ":" in stripped:
-                # Keep category name, drop its description
-                cat_name = stripped.split(":")[0].strip()
+            elif stripped.endswith(":") or ": " in stripped:
+                # Keep category name, drop its description. Split on ": "
+                # so org-style category names ("org:acme") survive, and
+                # rstrip(":") handles a plain "creative:" / "org:acme:".
+                cat_name = stripped.split(": ", 1)[0].strip().rstrip(":")
                 compact_lines.append(f"  {cat_name}:")
                 in_skill_entry = False
             else:
@@ -397,17 +412,28 @@ def _on_pre_llm_call(session_id: str, user_message: str, **kwargs) -> dict | Non
             logger.debug("Chit-chat message — skipping skill injection")
             return None
         cap_kwargs = _capability_kwargs_for_session(session_id)
-        if cap_kwargs is None and session_id:
-            # Named session without a snapshot (never built, or evicted): the
-            # fail-open corpus could suggest skills Hermes hides. Skip the turn.
-            logger.debug("No capability snapshot for session %s — skipping", session_id)
-            return None
-        index = get_index(**cap_kwargs) if cap_kwargs is not None else get_index()
+        snapshot_known = cap_kwargs is not None
+        if not snapshot_known:
+            # No capability snapshot for this session (gateway restart,
+            # resumed session, evicted LRU entry). Skipping the whole turn
+            # was too cautious: only skills whose activation depends on
+            # tool capabilities are unsafe without the snapshot. Retrieve
+            # fail-open and filter exactly those out of the results.
+            logger.debug(
+                "No capability snapshot for session %s — fail-open retrieval "
+                "(tool-dependent skills filtered)", session_id,
+            )
+        index = get_index(**cap_kwargs) if snapshot_known else get_index()
         if index is None:
             return None
 
         results = index.retrieve(user_message, top_k=TOP_K)
         results = _apply_relevance_floor(results, MIN_SCORE_RATIO)
+        if not snapshot_known:
+            results = [
+                (skill_id, score) for skill_id, score in results
+                if not (get_skill_info(skill_id) or {}).get("needs_tools")
+            ]
         if not results:
             return None
 

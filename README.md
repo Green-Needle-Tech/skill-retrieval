@@ -8,9 +8,11 @@ See [SKILL.md](SKILL.md) for full architecture, token measurements, how it works
 
 ## Installation
 
+This repository IS the plugin directory (repo root = plugin root):
+
 ```bash
-# From the agent_skills repo root
-ln -s "$(pwd)/plugins/skill-retrieval" ~/.hermes/plugins/skill-retrieval
+# From a checkout of this repo
+ln -s "$(pwd)" ~/.hermes/plugins/skill-retrieval
 
 # Dependencies (Hermes Python env)
 # pyyaml is the only dependency — usually already present in a Hermes env
@@ -27,17 +29,40 @@ Then restart the Hermes session so the plugin's `register()` runs.
 
 ## Configuration
 
+All settings are environment variables (read once at plugin import; restart
+the session to apply):
+
 | Setting | Default | Override |
 |---------|---------|----------|
 | Top-K results | `6` | `SKILL_RETRIEVAL_TOP_K` env var |
 | System prompt compaction | enabled | `SKILL_RETRIEVAL_COMPACT=0` disables compaction but keeps retrieval injection |
-| BM25 k1 | `1.5` | edit `scripts/bm25_retriever.py` |
-| BM25 b | `0.75` | edit `scripts/bm25_retriever.py` |
+| BM25 k1 | `1.5` | `SKILL_RETRIEVAL_K1` env var |
+| BM25 b | `0.75` | `SKILL_RETRIEVAL_B` env var |
+| Relevance floor | `0.25` | `SKILL_RETRIEVAL_MIN_SCORE_RATIO` env var (in `[0, 1)`) |
 
 ```bash
 export SKILL_RETRIEVAL_TOP_K=8
 export SKILL_RETRIEVAL_COMPACT=0  # retrieval-only mode; the skills prompt is left unchanged (the builder is still wrapped to record tool capabilities)
 ```
+
+## Development
+
+The test suite runs without a Hermes install (pure stdlib + pytest + pyyaml):
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+```
+
+CI runs the suite on every push and pull request
+([.github/workflows/ci.yml](.github/workflows/ci.yml)).
+
+## A note on history
+
+The repository's first commit message says "v1.0.0" but the first public
+release was tagged `v0.4.0` (the version in `plugin.yaml` at that commit).
+The published history was left unrewritten; `v0.5.0` onward follows
+`plugin.yaml` exactly.
 
 ## Uninstall
 
