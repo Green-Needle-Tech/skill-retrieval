@@ -8,7 +8,7 @@ description: >-
   skills is a concern, or when skill discovery quality matters.
 license: MIT
 metadata:
-  version: 0.3.1
+  version: 0.4.0
   author: moonlight-lupin
   platforms: [linux, macos, windows]
   tags: [bm25, skill-retrieval, system-prompt, token-optimization, plugin]
