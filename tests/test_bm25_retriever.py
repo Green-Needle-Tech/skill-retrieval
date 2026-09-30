@@ -1,0 +1,471 @@
+"""Tests for BM25 skill retriever — no real Hermes install required."""
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+import bm25_retriever as br
+
+
+# ─── tokenize ────────────────────────────────────────────────────────────────
+
+def test_tokenize_lowercases():
+    assert br.tokenize("Hello WORLD") == ["hello", "world"]
+
+
+def test_tokenize_removes_punctuation():
+    assert br.tokenize("foo, bar! baz?") == ["foo", "bar", "baz"]
+
+
+def test_tokenize_splits_whitespace():
+    assert br.tokenize("  a   b\tc\n") == ["a", "b", "c"]
+
+
+def test_tokenize_empty():
+    assert br.tokenize("") == []
+    assert br.tokenize("   ") == []
+
+
+def test_tokenize_mixed():
+    assert br.tokenize("Skill-Retrieval: BM25 (Okapi)") == [
+        "skill", "retrieval", "bm25", "okapi"
+    ]
+
+
+# ─── _parse_skill_md ─────────────────────────────────────────────────────────
+
+def test_parse_skill_md_basic(tmp_path):
+    skill_md = tmp_path / "SKILL.md"
+    skill_md.write_text(
+        "---\n"
+        "name: deep-research\n"
+        'description: "Autonomous research loop"\n'
+        "---\n"
+        "\n# Body\n"
+    )
+    name, desc = br._parse_skill_md(skill_md)
+    assert name == "deep-research"
+    assert desc == "Autonomous research loop"
+
+
+def test_parse_skill_md_multiline_description(tmp_path):
+    skill_md = tmp_path / "SKILL.md"
+    skill_md.write_text(
+        "---\n"
+        "name: skill-retrieval\n"
+        "description: >-\n"
+        "  BM25-based skill retrieval plugin.\n"
+        "  Saves tokens per turn.\n"
+        "author: moonlight-lupin\n"
+        "---\n"
+    )
+    name, desc = br._parse_skill_md(skill_md)
+    assert name == "skill-retrieval"
+    assert "BM25-based skill retrieval plugin." in desc
+    assert "Saves tokens per turn." in desc
+
+
+def test_parse_skill_md_missing_fields(tmp_path):
+    skill_md = tmp_path / "SKILL.md"
+    skill_md.write_text("---\nversion: 1.0\n---\n# No name\n")
+    name, desc = br._parse_skill_md(skill_md)
+    assert name == ""
+    assert desc == ""
+
+
+# ─── BM25Index ───────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def small_index():
+    ids = ["alpha", "beta", "gamma"]
+    texts = [
+        "image generation and photo editing with fal.ai",
+        "deep research think search extract synthesize",
+        "travel itinerary planning flights hotels calendar",
+    ]
+    index = br.BM25Index()
+    index.build(ids, texts)
+    return index
+
+
+def test_bm25_build_and_retrieve(small_index):
+    results = small_index.retrieve("image photo generation", top_k=3)
+    assert results
+    assert results[0][0] == "alpha"
+    assert results[0][1] > 0
+
+
+def test_bm25_scores_descending(small_index):
+    results = small_index.retrieve("research search extract", top_k=3)
+    assert results
+    scores = [s for _, s in results]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_bm25_respects_top_k(small_index):
+    results = small_index.retrieve("planning travel research image", top_k=2)
+    assert len(results) <= 2
+
+
+def test_bm25_empty_corpus():
+    index = br.BM25Index()
+    index.build([], [])
+    assert index.retrieve("anything") == []
+
+
+def test_bm25_empty_query(small_index):
+    assert small_index.retrieve("") == []
+    assert small_index.retrieve("   !!!") == []
+
+
+def test_bm25_no_matches(small_index):
+    # Tokens absent from vocabulary → no hits
+    assert small_index.retrieve("zzzzzyyyyxxxqqq") == []
+
+
+def test_bm25_single_document():
+    """Single-doc corpus: Lucene IDF log(1 + ...) stays positive, so it hits."""
+    index = br.BM25Index()
+    index.build(["only"], ["unique widget factory"])
+    assert index._built
+    results = index.retrieve("widget", top_k=5)
+    assert [r[0] for r in results] == ["only"]
+    assert results[0][1] > 0
+
+    index2 = br.BM25Index()
+    index2.build(
+        ["only", "other", "third"],
+        [
+            "unique widget factory",
+            "unrelated travel planning",
+            "calendar flights hotels",
+        ],
+    )
+    results = index2.retrieve("widget", top_k=5)
+    assert len(results) == 1
+    assert results[0][0] == "only"
+    assert results[0][1] > 0
+
+
+def test_bm25_term_in_half_the_corpus_still_retrieves():
+    """A term in >= half the docs must not be zeroed (old clipped IDF did)."""
+    index = br.BM25Index()
+    index.build(
+        ["commit", "rebase", "calendar"],
+        ["git commit helper", "git rebase tool", "calendar planner"],
+    )
+    assert {r[0] for r in index.retrieve("git", top_k=5)} == {"commit", "rebase"}
+
+
+def test_bm25_two_document_corpus_retrieves():
+    index = br.BM25Index()
+    index.build(["commit", "calendar"], ["git commit helper", "calendar planner"])
+    assert [r[0] for r in index.retrieve("commit", top_k=5)] == ["commit"]
+
+
+def test_bm25_not_built_returns_empty():
+    index = br.BM25Index()
+    assert index.retrieve("query") == []
+
+
+# ─── load_active_skills ──────────────────────────────────────────────────────
+
+def _write_skill(root: Path, rel: str, name: str, description: str) -> Path:
+    skill_dir = root / rel
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        f"---\nname: {name}\ndescription: \"{description}\"\n---\n\n# {name}\n"
+    )
+    return skill_md
+
+
+def test_load_active_skills_standalone_and_plugin(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    plugins_root = tmp_path / "plugins"
+    config_path = tmp_path / "config.yaml"
+
+    _write_skill(skills_root, "research/deep-research", "deep-research",
+                 "Autonomous research engine")
+    _write_skill(skills_root, "creative/image-studio", "image-studio",
+                 "fal.ai image generation")
+
+    plugin_skills = plugins_root / "chief-of-staff" / "skills"
+    _write_skill(plugin_skills, "briefing", "daily-briefing",
+                 "Morning briefing compilation")
+
+    config_path.write_text("skills:\n  disabled: []\n")
+
+    monkeypatch.setattr(br, "SKILLS_ROOT", skills_root)
+    monkeypatch.setattr(br, "PLUGINS_ROOT", plugins_root)
+    monkeypatch.setattr(br, "CONFIG_PATH", config_path)
+
+    skills = br.load_active_skills()
+    ids = {s["skill_id"] for s in skills}
+    assert "research/deep-research" in ids
+    assert "creative/image-studio" in ids
+    assert "chief-of-staff:briefing" in ids
+
+    by_id = {s["skill_id"]: s for s in skills}
+    assert by_id["research/deep-research"]["name"] == "deep-research"
+    assert "Autonomous research" in by_id["research/deep-research"]["description"]
+    assert by_id["chief-of-staff:briefing"]["leaf_name"] == "briefing"
+
+
+def test_load_active_skills_respects_disabled(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    plugins_root = tmp_path / "plugins"
+    config_path = tmp_path / "config.yaml"
+
+    _write_skill(skills_root, "a/keep-me", "keep-me", "Should load")
+    _write_skill(skills_root, "a/drop-me", "drop-me", "Should skip")
+    plugins_root.mkdir()
+    config_path.write_text("skills:\n  disabled:\n    - drop-me\n")
+
+    monkeypatch.setattr(br, "SKILLS_ROOT", skills_root)
+    monkeypatch.setattr(br, "PLUGINS_ROOT", plugins_root)
+    monkeypatch.setattr(br, "CONFIG_PATH", config_path)
+
+    skills = br.load_active_skills()
+    ids = {s["skill_id"] for s in skills}
+    assert "a/keep-me" in ids
+    assert "a/drop-me" not in ids
+
+
+def test_load_active_skills_skips_archive_dirs(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    plugins_root = tmp_path / "plugins"
+    config_path = tmp_path / "config.yaml"
+
+    _write_skill(skills_root, "live/ok", "ok", "Live skill")
+    _write_skill(skills_root, ".archive/old", "old", "Archived")
+    plugins_root.mkdir()
+    config_path.write_text("skills:\n  disabled: []\n")
+
+    monkeypatch.setattr(br, "SKILLS_ROOT", skills_root)
+    monkeypatch.setattr(br, "PLUGINS_ROOT", plugins_root)
+    monkeypatch.setattr(br, "CONFIG_PATH", config_path)
+
+    skills = br.load_active_skills()
+    ids = {s["skill_id"] for s in skills}
+    assert "live/ok" in ids
+    assert not any(".archive" in i for i in ids)
+
+
+def test_load_active_skills_empty_roots(tmp_path, monkeypatch):
+    monkeypatch.setattr(br, "SKILLS_ROOT", tmp_path / "missing-skills")
+    monkeypatch.setattr(br, "PLUGINS_ROOT", tmp_path / "missing-plugins")
+    monkeypatch.setattr(br, "CONFIG_PATH", tmp_path / "missing-config.yaml")
+    assert br.load_active_skills() == []
+
+
+def test_load_active_skills_empty_yaml_config(tmp_path, monkeypatch):
+    """Empty or null YAML must not crash on `.get()`."""
+    skills_root = tmp_path / "skills"
+    plugins_root = tmp_path / "plugins"
+    config_path = tmp_path / "config.yaml"
+    _write_skill(skills_root, "a/ok", "ok", "Still loads")
+    plugins_root.mkdir()
+    config_path.write_text("")  # yaml.safe_load → None
+
+    monkeypatch.setattr(br, "SKILLS_ROOT", skills_root)
+    monkeypatch.setattr(br, "PLUGINS_ROOT", plugins_root)
+    monkeypatch.setattr(br, "CONFIG_PATH", config_path)
+
+    skills = br.load_active_skills()
+    assert {s["skill_id"] for s in skills} == {"a/ok"}
+
+
+def test_load_active_skills_uses_hermes_discovery_precedence(tmp_path, monkeypatch):
+    """Hermes runtime path should include project, local, and external dirs."""
+    project_root = tmp_path / "project-skills"
+    local_root = tmp_path / "profile-skills"
+    external_root = tmp_path / "external-skills"
+    plugins_root = tmp_path / "plugins"
+
+    _write_skill(project_root, "shared", "shared", "Project copy wins")
+    _write_skill(local_root, "shadow", "shadow", "Local copy is shadowed")
+    _write_skill(external_root, "external-only", "external-only", "External skill")
+    _write_skill(plugins_root / "helper" / "skills", "bundled", "bundled", "Bundled skill")
+
+    # Legacy path constants stay unset, so this runs the Hermes-discovery
+    # branch of load_active_skills().
+    monkeypatch.setattr(br, "get_plugins_dir", lambda: plugins_root)
+
+    # Registry-aware loader: with the real Hermes registry reachable, plugin
+    # skills come from the registry, not the fixture dir. Stub it to report
+    # the fixture plugin's bundled skill so this test keeps exercising the
+    # precedence chain (project → local → external → plugin).
+    plugin_registry = types.ModuleType("hermes_cli.plugins")
+    plugin_registry.discover_plugins = lambda: None
+
+    class _FakePM:
+        def list_plugin_skill_metadata(self):
+            return [
+                {
+                    "name": "helper:bundled",
+                    "description": "Bundled skill",
+                    "category": "plugin",
+                    "frontmatter": {"name": "bundled", "description": "Bundled skill"},
+                }
+            ]
+
+    plugin_registry.get_plugin_manager = lambda: _FakePM()
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugin_registry)
+
+    prompt_builder = types.ModuleType("agent.prompt_builder")
+    prompt_builder._current_session_platform_hint = lambda: ""
+    prompt_builder.extract_skill_conditions = lambda frontmatter: {}
+    prompt_builder._skill_should_show = lambda *args, **kwargs: True
+
+    def parse_skill_file(skill_file):
+        name, desc = br._parse_skill_md(skill_file)
+        return True, {"name": name}, desc
+
+    def build_snapshot_entry(skill_file, root, frontmatter, description):
+        rel = skill_file.relative_to(root)
+        return {
+            "category": "general",
+            "skill_name": rel.parent.name,
+            "frontmatter_name": frontmatter["name"],
+            "description": description,
+        }
+
+    prompt_builder._parse_skill_file = parse_skill_file
+    prompt_builder._build_snapshot_entry = build_snapshot_entry
+
+    skill_utils = types.ModuleType("agent.skill_utils")
+    skill_utils.get_disabled_skill_names = lambda platform=None: set()
+    skill_utils.get_project_skills_dirs = lambda: [project_root]
+    skill_utils.get_all_skills_dirs = lambda: [local_root, external_root]
+    skill_utils.iter_project_skill_files = lambda root: sorted(root.rglob("SKILL.md"))
+    skill_utils.iter_skill_index_files = lambda root, filename: sorted(root.rglob(filename))
+
+    agent = types.ModuleType("agent")
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.prompt_builder", prompt_builder)
+    monkeypatch.setitem(sys.modules, "agent.skill_utils", skill_utils)
+
+    skills = br.load_active_skills()
+    by_name = {s["name"]: s for s in skills}
+
+    assert by_name["shared"]["description"] == "Project copy wins"
+    assert by_name["external-only"]["description"] == "External skill"
+    # Registry-sourced plugin skills are keyed by their qualified name.
+    assert by_name["helper:bundled"]["skill_id"] == "helper:bundled"
+
+
+def test_get_index_cache_is_scoped_by_hermes_home(monkeypatch, tmp_path):
+    """Multiplexed profiles must not share one BM25 singleton index."""
+    br._indexes_by_home.clear()
+    br._skills_by_home_and_id.clear()
+    home = tmp_path / "profile-a"
+
+    monkeypatch.setattr(br, "_runtime_paths_are_overridden", lambda: False)
+    monkeypatch.setattr(br, "get_hermes_home", lambda: home)
+
+    def fake_skills():
+        return [
+            {
+                "skill_id": home.name,
+                "leaf_name": home.name,
+                "name": home.name,
+                "description": f"unique skill for {home.name}",
+                "text": f"{home.name}: unique skill for {home.name}",
+            },
+            {
+                "skill_id": f"{home.name}-other",
+                "leaf_name": f"{home.name}-other",
+                "name": f"{home.name}-other",
+                "description": "other filler skill",
+                "text": f"{home.name}-other: other filler skill",
+            },
+            {
+                "skill_id": f"{home.name}-third",
+                "leaf_name": f"{home.name}-third",
+                "name": f"{home.name}-third",
+                "description": "third filler skill",
+                "text": f"{home.name}-third: third filler skill",
+            },
+        ]
+
+    monkeypatch.setattr(br, "load_active_skills", fake_skills)
+
+    first = br.get_index()
+    home = tmp_path / "profile-b"
+    second = br.get_index()
+
+    assert first is not second
+    assert set(br._skills_by_home_and_id) == {
+        str((tmp_path / "profile-a").resolve(strict=False)),
+        str((tmp_path / "profile-b").resolve(strict=False)),
+    }
+
+def _load_plugin_module(module_name="skill_retrieval_plugin"):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    plugin_dir = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(plugin_dir))
+    spec = importlib.util.spec_from_file_location(
+        module_name, plugin_dir / "__init__.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ─── plugin env parsing ───────────────────────────────────────────────────────
+
+def test_parse_top_k_defaults_and_rejects_invalid():
+    mod = _load_plugin_module("skill_retrieval_top_k_test")
+
+    assert mod._parse_top_k(None) == 6
+    assert mod._parse_top_k("") == 6
+    assert mod._parse_top_k("8") == 8
+    assert mod._parse_top_k("nope") == 6
+    assert mod._parse_top_k("0") == 6
+    assert mod._parse_top_k("-3") == 6
+
+
+def test_parse_bool_env_accepts_compaction_switch_values():
+    mod = _load_plugin_module("skill_retrieval_bool_env_test")
+
+    assert mod._parse_bool_env(None) is True
+    assert mod._parse_bool_env("") is True
+    assert mod._parse_bool_env("1") is True
+    assert mod._parse_bool_env("true") is True
+    assert mod._parse_bool_env("yes") is True
+    assert mod._parse_bool_env("on") is True
+    assert mod._parse_bool_env("0") is False
+    assert mod._parse_bool_env("false") is False
+    assert mod._parse_bool_env("no") is False
+    assert mod._parse_bool_env("off") is False
+    assert mod._parse_bool_env("nonsense") is True
+
+
+def test_register_can_disable_prompt_compaction(monkeypatch):
+    mod = _load_plugin_module("skill_retrieval_register_compact_test")
+    called = []
+
+    class Ctx:
+        def __init__(self):
+            self.hooks = []
+
+        def register_hook(self, name, func):
+            self.hooks.append((name, func))
+
+    monkeypatch.setattr(mod, "COMPACT_SYSTEM_PROMPT", False)
+    # The wrapper is still installed (it records capability snapshots), but
+    # in pass-through mode.
+    monkeypatch.setattr(
+        mod, "_compact_skills_prompt", lambda compact=True: called.append(compact)
+    )
+
+    ctx = Ctx()
+    mod.register(ctx)
+
+    assert called == [False]
+    assert ctx.hooks == [("pre_llm_call", mod._on_pre_llm_call)]
